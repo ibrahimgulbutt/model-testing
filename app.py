@@ -9,30 +9,98 @@ import plotly.express as px
 from pathlib import Path
 import tempfile
 import os
+import glob
 
 # Configure Streamlit page
 st.set_page_config(
-    page_title="YOLO11n Segmentation Tester",
+    page_title="YOLO Multi-Model Tester",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+def get_available_models():
+    """Get list of available model files in the models directory"""
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        return []
+    
+    # Look for common model file extensions
+    model_patterns = [
+        os.path.join(models_dir, "*.pt"),
+        os.path.join(models_dir, "*.onnx"),
+        os.path.join(models_dir, "*.engine")
+    ]
+    
+    models = []
+    for pattern in model_patterns:
+        models.extend(glob.glob(pattern))
+    
+    # Return just the filenames, not full paths
+    return [os.path.basename(model) for model in models if os.path.isfile(model)]
+
 # Cache the model loading to avoid reloading on every interaction
 @st.cache_resource
-def load_model():
-    """Load the YOLO11n segmentation model"""
+def load_model(model_path):
+    """Load the selected YOLO model with comprehensive error handling"""
     try:
-        model_path = "yolo11n-seg.pt"
-        if not os.path.exists(model_path):
-            st.error(f"Model file '{model_path}' not found!")
-            return None
+        full_path = os.path.join("models", model_path)
+        if not os.path.exists(full_path):
+            return None, {"error": f"Model file '{full_path}' not found!"}
         
-        model = YOLO(model_path)
-        return model
+        # Check file size
+        file_size = os.path.getsize(full_path)
+        if file_size < 1000:  # Less than 1KB, probably not a valid model
+            return None, {"error": f"Model file '{model_path}' seems too small ({file_size} bytes). It may be corrupted."}
+        
+        # Try to load the model with detailed error handling
+        model = YOLO(full_path)
+        
+        # Validate the model was loaded properly
+        if not hasattr(model, 'model') or model.model is None:
+            return None, {"error": f"Model '{model_path}' loaded but appears to be invalid or corrupted."}
+        
+        # Get model info
+        model_info = {
+            'path': full_path,
+            'name': model_path,
+            'task': getattr(model, 'task', 'detect'),  # default to detect
+            'names': getattr(model, 'names', {}),
+            'nc': len(getattr(model, 'names', {})),
+            'file_size': f"{file_size / (1024*1024):.1f} MB",
+            'success': True
+        }
+        
+        # Additional validation
+        if not model_info['names']:
+            model_info['warning'] = "No class names found - model may not be fully trained"
+        
+        return model, model_info
+        
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "file in archive is not in a subdirectory" in error_msg:
+            return None, {
+                "error": f"Model '{model_path}' has an invalid internal structure. This usually means:\n" +
+                        "• The model file is corrupted\n" +
+                        "• The model was saved incorrectly\n" +
+                        "• The file is not a valid YOLO model\n\n" +
+                        "Try re-downloading or re-training the model."
+            }
+        elif "PytorchStreamReader" in error_msg:
+            return None, {
+                "error": f"Model '{model_path}' appears to be corrupted or not a valid PyTorch model file."
+            }
+        else:
+            return None, {
+                "error": f"Runtime error loading '{model_path}':\n{error_msg}"
+            }
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None
+        error_msg = str(e)
+        return None, {
+            "error": f"Unexpected error loading '{model_path}':\n{error_msg}\n\n" +
+                    "Please check that this is a valid YOLO model file."
+        }
 
 def process_image(image, model, confidence=0.25, iou_threshold=0.45):
     """Process image with YOLO11n segmentation"""
@@ -140,34 +208,91 @@ def create_detection_stats(result):
     return class_counts, class_confidences
 
 def main():
-    st.title("🎯 YOLO11n Segmentation Tester")
-    st.markdown("Upload an image to test the YOLO11n segmentation model")
+    st.title("🎯 YOLO Multi-Model Tester")
+    st.markdown("Select a model and upload an image to test YOLO object detection/segmentation")
     
     # Sidebar for settings
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("⚙️ Model Selection & Settings")
         
-        # Model info
-        st.subheader("📋 Model Information")
-        model = load_model()
+        # Model selection
+        st.subheader("🤖 Available Models")
+        available_models = get_available_models()
         
-        if model is not None:
-            st.success("✅ Model loaded successfully!")
-            st.info(f"Model type: YOLO11n Segmentation")
+        if not available_models:
+            st.error("❌ No model files found in 'models/' directory!")
+            st.info("Please add .pt, .onnx, or .engine model files to the 'models/' folder")
+            return
+        
+        # Model selector
+        selected_model = st.selectbox(
+            "Choose a model:",
+            available_models,
+            help="Select a YOLO model from the models directory"
+        )
+        
+        if selected_model:
+            # Load the selected model
+            model, model_info = load_model(selected_model)
             
-            # Display class names if available
-            if hasattr(model, 'names') and model.names:
-                st.subheader("🏷️ Detectable Classes")
-                class_names = list(model.names.values())
-                st.write(f"Total classes: {len(class_names)}")
+            if model is not None and model_info is not None and model_info.get('success'):
+                st.success("✅ Model loaded successfully!")
                 
-                # Show classes in a more compact format
-                cols = st.columns(2)
-                for i, class_name in enumerate(class_names):
-                    col = cols[i % 2]
-                    col.write(f"• {class_name}")
+                # Model information
+                st.subheader("📋 Model Information")
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    st.metric("Model", model_info['name'])
+                    st.metric("Task", model_info['task'].title())
+                    st.metric("File Size", model_info['file_size'])
+                with col2:
+                    st.metric("Classes", model_info['nc'])
+                
+                # Show warnings if any
+                if 'warning' in model_info:
+                    st.warning(f"⚠️ {model_info['warning']}")
+                
+                # Display class names if available
+                if model_info['names']:
+                    st.subheader("🏷️ Detectable Classes")
+                    class_names = list(model_info['names'].values())
+                    st.write(f"Total classes: {len(class_names)}")
+                    
+                    # Show classes in expandable section for better space usage
+                    with st.expander("View all classes", expanded=False):
+                        # Show classes in a more compact format
+                        cols = st.columns(2)
+                        for i, class_name in enumerate(class_names):
+                            col = cols[i % 2]
+                            col.write(f"• {class_name}")
+                else:
+                    st.info("ℹ️ No class information available for this model")
+                    
+            elif model_info and 'error' in model_info:
+                st.error("❌ Failed to load selected model")
+                st.error(model_info['error'])
+                
+                # Provide helpful suggestions
+                st.subheader("💡 Troubleshooting Tips")
+                st.markdown("""
+                **Common solutions:**
+                1. **Re-download the model** from the original source
+                2. **Check file integrity** - ensure the download completed successfully
+                3. **Try a different model format** (.pt, .onnx, .engine)
+                4. **Verify model compatibility** with your YOLO version
+                5. **Re-train the model** if it's a custom model
+                
+                **Valid model sources:**
+                - [Ultralytics YOLO Models](https://github.com/ultralytics/ultralytics)
+                - [YOLO Official Repository](https://github.com/ultralytics/yolov5)
+                - Your own trained models (ensure proper saving format)
+                """)
+                return
+            else:
+                st.error("❌ Unknown error loading model")
+                return
         else:
-            st.error("❌ Failed to load model")
+            st.warning("Please select a model to continue")
             return
         
         st.divider()
@@ -223,14 +348,15 @@ def main():
             st.subheader("🔍 Processing Results")
             
             # Process button
-            if st.button("🚀 Run Segmentation", type="primary"):
+            if st.button("🚀 Run Detection/Segmentation", type="primary"):
                 with st.spinner("Processing image..."):
                     result = process_image(image, model, confidence, iou_threshold)
                     
                     if result is not None:
                         # Draw results
                         result_image = draw_segmentation_results(image, result)
-                        st.image(result_image, caption="Segmentation Results", width='stretch')
+                        task_type = "Segmentation" if hasattr(result, 'masks') and result.masks is not None else "Detection"
+                        st.image(result_image, caption=f"{task_type} Results", width='stretch')
                         
                         # Detection statistics
                         stats = create_detection_stats(result)

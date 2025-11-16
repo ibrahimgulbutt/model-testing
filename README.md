@@ -1,14 +1,17 @@
-# 🎯 YOLO11n Segmentation Tester
+# 🎯 YOLO Multi-Model Tester
 
-A modern Streamlit web application for testing your YOLO11n segmentation model with an intuitive interface.
+A modern Streamlit web application for testing multiple YOLO models with an intuitive interface. Supports detection, segmentation, and classification tasks.
 
 ## ✨ Features
 
-- 🖼️ **Image Upload & Processing** - Upload images and get instant segmentation results
+- 🤖 **Multi-Model Support** - Automatically detects and lists all YOLO models in the models/ directory
+- 🔄 **Dynamic Model Selection** - Switch between different models with different class sets
+- 🖼️ **Image Upload & Processing** - Upload images and get instant detection/segmentation results
 - 🎨 **Visual Results** - See segmentation masks overlaid on original images with bounding boxes
 - 📊 **Detection Statistics** - View detailed stats including class counts and confidence scores
 - ⚙️ **Adjustable Parameters** - Fine-tune confidence and IoU thresholds in real-time
 - 🗂️ **Batch Processing** - Process multiple images at once
+- 🛡️ **Model Validation** - Built-in model validation with detailed error messages
 - 📱 **Responsive Design** - Works on desktop and mobile devices
 
 ## 🚀 Quick Start
