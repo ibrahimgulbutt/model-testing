@@ -20,438 +20,401 @@ st.set_page_config(
 )
 
 def get_available_models():
-    """Get list of available model files in the models directory"""
-    models_dir = "models"
-    if not os.path.exists(models_dir):
+    """Get list of available model files in the models directory (including subdirectories)"""
+    models_dir = Path("models")
+    if not models_dir.exists():
         return []
-    
-    # Look for common model file extensions
-    model_patterns = [
-        os.path.join(models_dir, "*.pt"),
-        os.path.join(models_dir, "*.onnx"),
-        os.path.join(models_dir, "*.engine")
-    ]
-    
-    models = []
-    for pattern in model_patterns:
-        models.extend(glob.glob(pattern))
-    
-    # Return just the filenames, not full paths
-    return [os.path.basename(model) for model in models if os.path.isfile(model)]
 
-# Cache the model loading to avoid reloading on every interaction
+    # Recursively find all model files
+    models = []
+    for ext in ("*.pt", "*.onnx", "*.engine"):
+        for p in models_dir.rglob(ext):
+            if p.is_file():
+                # Store as relative path from models_dir for display
+                models.append(str(p.relative_to(models_dir)))
+
+    return sorted(models)
+
+
 @st.cache_resource
-def load_model(model_path):
-    """Load the selected YOLO model with comprehensive error handling"""
+def load_model(model_rel_path):
+    """Load the selected YOLO model with comprehensive error handling.
+    model_rel_path is relative to the 'models/' directory.
+    """
     try:
-        full_path = os.path.join("models", model_path)
+        full_path = os.path.join("models", model_rel_path)
         if not os.path.exists(full_path):
             return None, {"error": f"Model file '{full_path}' not found!"}
-        
-        # Check file size
+
         file_size = os.path.getsize(full_path)
-        if file_size < 1000:  # Less than 1KB, probably not a valid model
-            return None, {"error": f"Model file '{model_path}' seems too small ({file_size} bytes). It may be corrupted."}
-        
-        # Try to load the model with detailed error handling
+        if file_size < 1000:
+            return None, {"error": f"Model file '{model_rel_path}' seems too small ({file_size} bytes). It may be corrupted."}
+
         model = YOLO(full_path)
-        
-        # Validate the model was loaded properly
+
         if not hasattr(model, 'model') or model.model is None:
-            return None, {"error": f"Model '{model_path}' loaded but appears to be invalid or corrupted."}
-        
-        # Get model info
+            return None, {"error": f"Model '{model_rel_path}' loaded but appears to be invalid or corrupted."}
+
         model_info = {
             'path': full_path,
-            'name': model_path,
-            'task': getattr(model, 'task', 'detect'),  # default to detect
+            'name': model_rel_path,
+            'task': getattr(model, 'task', 'detect'),
             'names': getattr(model, 'names', {}),
             'nc': len(getattr(model, 'names', {})),
             'file_size': f"{file_size / (1024*1024):.1f} MB",
             'success': True
         }
-        
-        # Additional validation
+
         if not model_info['names']:
             model_info['warning'] = "No class names found - model may not be fully trained"
-        
+
         return model, model_info
-        
+
     except RuntimeError as e:
         error_msg = str(e)
         if "file in archive is not in a subdirectory" in error_msg:
             return None, {
-                "error": f"Model '{model_path}' has an invalid internal structure. This usually means:\n" +
-                        "• The model file is corrupted\n" +
-                        "• The model was saved incorrectly\n" +
-                        "• The file is not a valid YOLO model\n\n" +
-                        "Try re-downloading or re-training the model."
+                "error": (
+                    f"Model '{model_rel_path}' has an invalid internal structure. This usually means:\n"
+                    "• The model file is corrupted\n"
+                    "• The model was saved incorrectly\n"
+                    "• The file is not a valid YOLO model\n\n"
+                    "Try re-downloading or re-training the model."
+                )
             }
         elif "PytorchStreamReader" in error_msg:
-            return None, {
-                "error": f"Model '{model_path}' appears to be corrupted or not a valid PyTorch model file."
-            }
+            return None, {"error": f"Model '{model_rel_path}' appears to be corrupted or not a valid PyTorch model file."}
         else:
-            return None, {
-                "error": f"Runtime error loading '{model_path}':\n{error_msg}"
-            }
+            return None, {"error": f"Runtime error loading '{model_rel_path}':\n{error_msg}"}
     except Exception as e:
-        error_msg = str(e)
-        return None, {
-            "error": f"Unexpected error loading '{model_path}':\n{error_msg}\n\n" +
-                    "Please check that this is a valid YOLO model file."
-        }
+        return None, {"error": f"Unexpected error loading '{model_rel_path}':\n{str(e)}\n\nPlease check that this is a valid YOLO model file."}
+
 
 def process_image(image, model, confidence=0.25, iou_threshold=0.45):
-    """Process image with YOLO11n segmentation"""
+    """Run inference on a PIL image."""
     try:
-        # Convert PIL to numpy array
         img_array = np.array(image)
-        
-        # Run inference
-        results = model(
-            img_array,
-            conf=confidence,
-            iou=iou_threshold,
-            verbose=False
-        )
-        
+        results = model(img_array, conf=confidence, iou=iou_threshold, verbose=False)
         return results[0] if results else None
     except Exception as e:
         st.error(f"Error processing image: {str(e)}")
         return None
 
-def draw_segmentation_results(image, result):
-    """Draw segmentation masks and bounding boxes on image"""
-    if result is None or result.masks is None:
+
+def draw_results(image, result):
+    """Draw segmentation masks and/or bounding boxes on image."""
+    if result is None:
         return image
-    
-    # Convert PIL to OpenCV format
+
     img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    
-    # Get masks and boxes
-    masks = result.masks.data.cpu().numpy()
+
     boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else []
     classes = result.boxes.cls.cpu().numpy() if result.boxes is not None else []
     confidences = result.boxes.conf.cpu().numpy() if result.boxes is not None else []
-    
-    # Generate colors for each class
-    colors = []
-    for i in range(len(masks)):
-        colors.append((
-            int(np.random.randint(0, 255)),
-            int(np.random.randint(0, 255)),
-            int(np.random.randint(0, 255))
-        ))
-    
-    # Draw masks
-    for i, mask in enumerate(masks):
-        # Resize mask to match image dimensions
-        mask_resized = cv2.resize(mask, (img.shape[1], img.shape[0]))
-        mask_binary = (mask_resized > 0.5).astype(np.uint8)
-        
-        # Create colored mask
-        colored_mask = np.zeros_like(img)
-        colored_mask[mask_binary == 1] = colors[i]
-        
-        # Blend with original image
-        img = cv2.addWeighted(img, 0.7, colored_mask, 0.3, 0)
-        
-        # Draw contours
-        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(img, contours, -1, colors[i], 2)
-    
+
+    np.random.seed(42)
+    colors = [
+        (int(np.random.randint(50, 255)), int(np.random.randint(50, 255)), int(np.random.randint(50, 255)))
+        for _ in range(max(len(boxes), 1))
+    ]
+
+    # Draw segmentation masks if present
+    if result.masks is not None:
+        masks = result.masks.data.cpu().numpy()
+        for i, mask in enumerate(masks):
+            mask_resized = cv2.resize(mask, (img.shape[1], img.shape[0]))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8)
+            colored_mask = np.zeros_like(img)
+            colored_mask[mask_binary == 1] = colors[i % len(colors)]
+            img = cv2.addWeighted(img, 0.7, colored_mask, 0.3, 0)
+            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(img, contours, -1, colors[i % len(colors)], 2)
+
     # Draw bounding boxes and labels
     for i, (box, cls, conf) in enumerate(zip(boxes, classes, confidences)):
         x1, y1, x2, y2 = map(int, box)
-        
-        # Get class name
+        color = colors[i % len(colors)]
         class_name = result.names[int(cls)] if hasattr(result, 'names') else f"Class {int(cls)}"
         label = f"{class_name}: {conf:.2f}"
-        
-        # Draw bounding box
-        cv2.rectangle(img, (x1, y1), (x2, y2), colors[i], 2)
-        
-        # Draw label background
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
         (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        cv2.rectangle(img, (x1, y1 - 20), (x1 + w, y1), colors[i], -1)
-        
-        # Draw label text
+        cv2.rectangle(img, (x1, y1 - 20), (x1 + w, y1), color, -1)
         cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    
-    # Convert back to RGB
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_rgb)
+
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
 
 def create_detection_stats(result):
-    """Create detection statistics"""
+    """Return (class_counts, class_confidences) dicts."""
     if result is None or result.boxes is None:
         return None
-    
+
     classes = result.boxes.cls.cpu().numpy()
     confidences = result.boxes.conf.cpu().numpy()
-    
-    # Count detections per class
     class_counts = {}
     class_confidences = {}
-    
+
     for cls, conf in zip(classes, confidences):
         class_name = result.names[int(cls)] if hasattr(result, 'names') else f"Class {int(cls)}"
-        
-        if class_name not in class_counts:
-            class_counts[class_name] = 0
-            class_confidences[class_name] = []
-        
+        class_counts.setdefault(class_name, 0)
+        class_confidences.setdefault(class_name, [])
         class_counts[class_name] += 1
         class_confidences[class_name].append(conf)
-    
+
     return class_counts, class_confidences
+
+
+def render_model_info(model_info, label=""):
+    """Render model metadata in sidebar."""
+    if label:
+        st.caption(label)
+    c1, c2 = st.columns(2)
+    c1.metric("Task", model_info['task'].title())
+    c1.metric("Size", model_info['file_size'])
+    c2.metric("Classes", model_info['nc'])
+    if 'warning' in model_info:
+        st.warning(f"⚠️ {model_info['warning']}")
+    if model_info.get('names'):
+        with st.expander("View classes", expanded=False):
+            cols = st.columns(2)
+            for i, name in enumerate(model_info['names'].values()):
+                cols[i % 2].write(f"• {name}")
+
+
+def render_result_panel(label, result_image, result, tag=""):
+    """Render detection result image + stats."""
+    task_type = "Segmentation" if (result is not None and result.masks is not None) else "Detection"
+    st.image(result_image, caption=f"{label} — {task_type}", use_container_width=True)
+
+    stats = create_detection_stats(result)
+    if stats:
+        class_counts, class_confidences = stats
+        total = sum(class_counts.values())
+        st.metric("Total Detections", total)
+        if class_counts:
+            ca, cb = st.columns([1, 1])
+            with ca:
+                st.write("**Per class:**")
+                for cls, cnt in class_counts.items():
+                    avg_conf = np.mean(class_confidences[cls])
+                    st.write(f"• {cls}: {cnt} (avg {avg_conf:.2f})")
+            with cb:
+                fig = px.bar(
+                    x=list(class_counts.keys()),
+                    y=list(class_counts.values()),
+                    title="Detections by Class",
+                    labels={'x': 'Class', 'y': 'Count'}
+                )
+                fig.update_layout(height=280)
+                st.plotly_chart(fig, use_container_width=True, key=f"chart_{tag}")
+    else:
+        st.warning("No objects detected. Try lowering the confidence threshold.")
+
+
+# ─── SIDEBAR ────────────────────────────────────────────────────────────────
 
 def main():
     st.title("🎯 YOLO Multi-Model Tester")
-    st.markdown("Select a model and upload an image to test YOLO object detection/segmentation")
-    
-    # Sidebar for settings
+
+    available_models = get_available_models()
+
     with st.sidebar:
-        st.header("⚙️ Model Selection & Settings")
-        
-        # Model selection
-        st.subheader("🤖 Available Models")
-        available_models = get_available_models()
-        
+        st.header("⚙️ Settings")
+
         if not available_models:
             st.error("❌ No model files found in 'models/' directory!")
-            st.info("Please add .pt, .onnx, or .engine model files to the 'models/' folder")
+            st.info("Add .pt, .onnx, or .engine files to models/ or its subdirectories.")
             return
-        
-        # Model selector
-        selected_model = st.selectbox(
-            "Choose a model:",
-            available_models,
-            help="Select a YOLO model from the models directory"
+
+        # ── Mode toggle ──────────────────────────────────────────────────────
+        mode = st.radio(
+            "Test mode",
+            ["Single model", "Compare two models"],
+            index=0,
+            help="Single: run one model. Compare: run both models side-by-side."
         )
-        
-        if selected_model:
-            # Load the selected model
-            model, model_info = load_model(selected_model)
-            
-            if model is not None and model_info is not None and model_info.get('success'):
-                st.success("✅ Model loaded successfully!")
-                
-                # Model information
-                st.subheader("📋 Model Information")
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    st.metric("Model", model_info['name'])
-                    st.metric("Task", model_info['task'].title())
-                    st.metric("File Size", model_info['file_size'])
-                with col2:
-                    st.metric("Classes", model_info['nc'])
-                
-                # Show warnings if any
-                if 'warning' in model_info:
-                    st.warning(f"⚠️ {model_info['warning']}")
-                
-                # Display class names if available
-                if model_info['names']:
-                    st.subheader("🏷️ Detectable Classes")
-                    class_names = list(model_info['names'].values())
-                    st.write(f"Total classes: {len(class_names)}")
-                    
-                    # Show classes in expandable section for better space usage
-                    with st.expander("View all classes", expanded=False):
-                        # Show classes in a more compact format
-                        cols = st.columns(2)
-                        for i, class_name in enumerate(class_names):
-                            col = cols[i % 2]
-                            col.write(f"• {class_name}")
-                else:
-                    st.info("ℹ️ No class information available for this model")
-                    
-            elif model_info and 'error' in model_info:
-                st.error("❌ Failed to load selected model")
-                st.error(model_info['error'])
-                
-                # Provide helpful suggestions
-                st.subheader("💡 Troubleshooting Tips")
-                st.markdown("""
-                **Common solutions:**
-                1. **Re-download the model** from the original source
-                2. **Check file integrity** - ensure the download completed successfully
-                3. **Try a different model format** (.pt, .onnx, .engine)
-                4. **Verify model compatibility** with your YOLO version
-                5. **Re-train the model** if it's a custom model
-                
-                **Valid model sources:**
-                - [Ultralytics YOLO Models](https://github.com/ultralytics/ultralytics)
-                - [YOLO Official Repository](https://github.com/ultralytics/yolov5)
-                - Your own trained models (ensure proper saving format)
-                """)
-                return
-            else:
-                st.error("❌ Unknown error loading model")
-                return
-        else:
-            st.warning("Please select a model to continue")
-            return
-        
+
         st.divider()
-        
-        # Inference parameters
+
+        # ── Model A ──────────────────────────────────────────────────────────
+        st.subheader("🤖 Model A")
+        model_a_name = st.selectbox("Model A", available_models, key="model_a")
+        model_a, info_a = load_model(model_a_name)
+
+        if model_a is None:
+            st.error(f"❌ {info_a.get('error', 'Unknown error')}")
+            return
+        st.success("✅ Loaded")
+        render_model_info(info_a, label=model_a_name)
+
+        # ── Model B (comparison mode only) ───────────────────────────────────
+        model_b, info_b = None, None
+        if mode == "Compare two models":
+            st.divider()
+            st.subheader("🤖 Model B")
+            default_b = available_models[1] if len(available_models) > 1 else available_models[0]
+            model_b_name = st.selectbox("Model B", available_models, index=available_models.index(default_b), key="model_b")
+            model_b, info_b = load_model(model_b_name)
+            if model_b is None:
+                st.error(f"❌ {info_b.get('error', 'Unknown error')}")
+                return
+            st.success("✅ Loaded")
+            render_model_info(info_b, label=model_b_name)
+
+        st.divider()
+
+        # ── Inference params ─────────────────────────────────────────────────
         st.subheader("🔧 Inference Parameters")
-        confidence = st.slider(
-            "Confidence Threshold",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.25,
-            step=0.05,
-            help="Minimum confidence score for detections"
+        confidence = st.slider("Confidence Threshold", 0.05, 1.0, 0.25, 0.05)
+        iou_threshold = st.slider("IoU Threshold", 0.1, 1.0, 0.45, 0.05)
+
+    # ─── MAIN AREA ───────────────────────────────────────────────────────────
+
+    if mode == "Single model":
+        _single_model_ui(model_a, model_a_name, confidence, iou_threshold)
+    else:
+        _compare_models_ui(
+            model_a, model_a_name,
+            model_b, model_b_name,
+            confidence, iou_threshold
         )
-        
-        iou_threshold = st.slider(
-            "IoU Threshold",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.45,
-            step=0.05,
-            help="IoU threshold for Non-Maximum Suppression"
-        )
-        
-        st.divider()
-        
-        # Example images
-        st.subheader("📸 Try Example Images")
-        if st.button("🏠 Use sample image (if available)"):
-            st.info("Upload your own image below!")
-    
-    # Main content area
-    col1, col2 = st.columns([1, 1])
-    
+
+    # Footer
+    st.divider()
+    st.markdown(
+        "<div style='text-align:center;color:#666;padding:10px;'>"
+        "🎯 YOLO Multi-Model Tester | Built with Streamlit"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+
+# ─── SINGLE MODEL UI ─────────────────────────────────────────────────────────
+
+def _single_model_ui(model, model_name, confidence, iou_threshold):
+    col1, col2 = st.columns(2)
+
     with col1:
         st.subheader("📤 Upload Image")
-        uploaded_file = st.file_uploader(
-            "Choose an image...",
+        uploaded = st.file_uploader(
+            "Choose an image…",
             type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
-            help="Upload an image for segmentation analysis"
+            key="single_upload"
         )
-        
-        if uploaded_file is not None:
-            # Display original image
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Original Image", width='stretch')
-            
-            # Image info
-            st.info(f"Image size: {image.size[0]}x{image.size[1]} pixels")
-    
+        if uploaded:
+            image = Image.open(uploaded)
+            st.image(image, caption="Original", use_container_width=True)
+            st.info(f"Size: {image.size[0]}×{image.size[1]} px")
+
     with col2:
-        if uploaded_file is not None:
-            st.subheader("🔍 Processing Results")
-            
-            # Process button
-            if st.button("🚀 Run Detection/Segmentation", type="primary"):
-                with st.spinner("Processing image..."):
+        if uploaded:
+            st.subheader(f"🔍 Results — {model_name}")
+            if st.button("🚀 Run Detection/Segmentation", type="primary", key="single_run"):
+                with st.spinner("Running inference…"):
                     result = process_image(image, model, confidence, iou_threshold)
-                    
                     if result is not None:
-                        # Draw results
-                        result_image = draw_segmentation_results(image, result)
-                        task_type = "Segmentation" if hasattr(result, 'masks') and result.masks is not None else "Detection"
-                        st.image(result_image, caption=f"{task_type} Results", width='stretch')
-                        
-                        # Detection statistics
-                        stats = create_detection_stats(result)
-                        if stats:
-                            class_counts, class_confidences = stats
-                            
-                            st.subheader("📊 Detection Statistics")
-                            
-                            # Summary metrics
-                            total_detections = sum(class_counts.values())
-                            st.metric("Total Detections", total_detections)
-                            
-                            if class_counts:
-                                # Class distribution
-                                col_a, col_b = st.columns([1, 1])
-                                
-                                with col_a:
-                                    st.write("**Detections per Class:**")
-                                    for class_name, count in class_counts.items():
-                                        avg_conf = np.mean(class_confidences[class_name])
-                                        st.write(f"• {class_name}: {count} (avg conf: {avg_conf:.2f})")
-                                
-                                with col_b:
-                                    # Create bar chart
-                                    fig = px.bar(
-                                        x=list(class_counts.keys()),
-                                        y=list(class_counts.values()),
-                                        title="Detections by Class",
-                                        labels={'x': 'Class', 'y': 'Count'}
-                                    )
-                                    fig.update_layout(height=300)
-                                    st.plotly_chart(fig, width='stretch')
-                        else:
-                            st.warning("No objects detected. Try adjusting the confidence threshold.")
+                        result_image = draw_results(image, result)
+                        render_result_panel(model_name, result_image, result, tag="single")
                     else:
-                        st.error("Failed to process image. Please try again.")
-    
-    # Additional features
+                        st.error("Inference failed. Please try again.")
+
+    _batch_section(model, confidence, iou_threshold)
+
+
+# ─── COMPARISON UI ────────────────────────────────────────────────────────────
+
+def _compare_models_ui(model_a, name_a, model_b, name_b, confidence, iou_threshold):
+    st.subheader("📤 Upload Image for Comparison")
+    uploaded = st.file_uploader(
+        "Choose an image…",
+        type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
+        key="compare_upload"
+    )
+
+    if not uploaded:
+        return
+
+    image = Image.open(uploaded)
+    st.image(image, caption=f"Original — {image.size[0]}×{image.size[1]} px", use_container_width=True)
+
+    if st.button("🚀 Run Both Models", type="primary", key="compare_run"):
+        with st.spinner("Running inference on both models…"):
+            result_a = process_image(image, model_a, confidence, iou_threshold)
+            result_b = process_image(image, model_b, confidence, iou_threshold)
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.subheader(f"Model A — {name_a}")
+            if result_a is not None:
+                img_a = draw_results(image, result_a)
+                render_result_panel(name_a, img_a, result_a, tag="cmp_a")
+            else:
+                st.error("Model A inference failed.")
+
+        with col_b:
+            st.subheader(f"Model B — {name_b}")
+            if result_b is not None:
+                img_b = draw_results(image, result_b)
+                render_result_panel(name_b, img_b, result_b, tag="cmp_b")
+            else:
+                st.error("Model B inference failed.")
+
+        # ── Side-by-side summary table ────────────────────────────────────
+        if result_a is not None and result_b is not None:
+            st.divider()
+            st.subheader("📊 Comparison Summary")
+
+            def _summary(result, name):
+                if result.boxes is None:
+                    return {"Model": name, "Total Detections": 0, "Unique Classes": 0, "Avg Confidence": "-"}
+                confs = result.boxes.conf.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy()
+                return {
+                    "Model": name,
+                    "Total Detections": len(confs),
+                    "Unique Classes": len(set(classes.astype(int))),
+                    "Avg Confidence": f"{confs.mean():.3f}" if len(confs) else "-",
+                    "Has Masks": "Yes" if result.masks is not None else "No",
+                }
+
+            import pandas as pd
+            df = pd.DataFrame([_summary(result_a, name_a), _summary(result_b, name_b)])
+            st.table(df.set_index("Model"))
+
+
+# ─── BATCH SECTION ────────────────────────────────────────────────────────────
+
+def _batch_section(model, confidence, iou_threshold):
     st.divider()
-    
-    # Batch processing section
     with st.expander("🗂️ Batch Processing (Multiple Images)", expanded=False):
-        st.markdown("Upload multiple images for batch processing")
-        
         uploaded_files = st.file_uploader(
-            "Choose multiple images...",
+            "Choose multiple images…",
             type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
             accept_multiple_files=True,
             key="batch_upload"
         )
-        
+
         if uploaded_files and len(uploaded_files) > 1:
             if st.button("🔄 Process All Images", type="secondary"):
                 progress_bar = st.progress(0)
-                results_container = st.container()
-                
-                with results_container:
-                    st.subheader("Batch Results")
-                    
-                    for i, file in enumerate(uploaded_files):
-                        progress_bar.progress((i + 1) / len(uploaded_files))
-                        
-                        with st.expander(f"📸 {file.name}", expanded=False):
-                            img = Image.open(file)
-                            col_orig, col_result = st.columns([1, 1])
-                            
-                            with col_orig:
-                                st.image(img, caption="Original", width='stretch')
-                            
-                            with col_result:
-                                result = process_image(img, model, confidence, iou_threshold)
-                                if result is not None:
-                                    result_img = draw_segmentation_results(img, result)
-                                    st.image(result_img, caption="Segmented", width='stretch')
-                                    
-                                    # Quick stats
-                                    if result.boxes is not None:
-                                        detections = len(result.boxes)
-                                        st.metric("Detections", detections)
-                                else:
-                                    st.error("Processing failed")
-                
+                for i, file in enumerate(uploaded_files):
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                    with st.expander(f"📸 {file.name}", expanded=False):
+                        img = Image.open(file)
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.image(img, caption="Original", use_container_width=True)
+                        with c2:
+                            result = process_image(img, model, confidence, iou_threshold)
+                            if result is not None:
+                                st.image(draw_results(img, result), caption="Result", use_container_width=True)
+                                if result.boxes is not None:
+                                    st.metric("Detections", len(result.boxes))
+                            else:
+                                st.error("Processing failed")
                 st.success("✅ Batch processing completed!")
-    
-    # Footer
-    st.divider()
-    st.markdown(
-        """
-        <div style='text-align: center; color: #666; padding: 20px;'>
-        <p>🎯 YOLO11n Segmentation Tester | Built with Streamlit</p>
-        <p>Upload images to test object detection and instance segmentation capabilities</p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+
 
 if __name__ == "__main__":
     main()
